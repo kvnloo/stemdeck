@@ -173,6 +173,103 @@ class Biquad {
 // actually land, and four biquads on one bus cost nothing worth counting.
 const BUTTERWORTH_Q8 = [0.50979558, 0.60134489, 0.89997622, 2.56291545];
 
+// Attacks the tempo stage must not play twice (#728).
+//
+// Below 1x a sequence plays 70 ms of input but moves on by only 70 * tempo, so
+// consecutive sequences overlap and whatever sits in the overlap is heard
+// twice. Sustained sound hides that. A kick does not: at 0.75x it came out as a
+// flam about 50 ms long. When the next sequence would replay an attack, the
+// chain instead carries straight on from where the last sequence stopped, which
+// splices identical samples and so is seamless, and borrows the time that costs.
+// Later sequences stretch a little harder to pay it back.
+//
+// Nothing is split or filtered, so unlike the attack path this file once had,
+// the output is still built only from whole grains of the input.
+const ATTACK_FRAME_MS   = 2;   // energy frame the detector works in
+const ATTACK_HISTORY_MS = 20;  // what an attack is measured against
+const ATTACK_RATIO      = 4;   // 6 dB above the recent level
+const ATTACK_FLOOR      = 1e-6; // ignore noise rising out of near silence
+const ATTACK_GAP_MS     = 30;  // one attack per kick, not one per frame of it
+// An attack is marked this far ahead of the frame that crossed the threshold,
+// so the few milliseconds of rise before it count as part of the attack.
+const ATTACK_LEAD_MS    = 4;
+// Borrowed input the chain may be ahead of its nominal clock by. The whole
+// mix, click included, goes through this one stage, so borrowing moves
+// everything together and the only effect is the playhead trailing the audio,
+// by this at most, until it is paid back.
+const MAX_BORROW_MS     = 100;
+// Share of a sequence's advance used to pay the loan back, so repayment is
+// spread thinly rather than stretching one sequence hard.
+const REPAY_SHARE       = 0.25;
+
+/**
+ * Marks attacks in a sample stream, by absolute sample position.
+ *
+ * Measured on the sample-to-sample difference rather than on the signal: the
+ * difference is dominated by high frequencies, which is what an attack is made
+ * of, while a bass line or a pad barely moves it. Plain energy missed most of
+ * the attacks in a full mix and placed the rest 8 to 30 ms late.
+ *
+ * Positions are absolute so they survive the FIFO compacting under them.
+ */
+class AttackTracker {
+  constructor(sr) {
+    this.frameLen = Math.max(1, Math.round(ATTACK_FRAME_MS * sr / 1000));
+    this.alpha = ATTACK_FRAME_MS / ATTACK_HISTORY_MS;
+    this.gap = Math.round(ATTACK_GAP_MS * sr / 1000);
+    this.lead = Math.round(ATTACK_LEAD_MS * sr / 1000);
+    this.clear();
+  }
+
+  clear() {
+    this.written = 0;    // absolute position of the next sample pushed
+    this.frameAcc = 0;
+    this.frameFill = 0;
+    this.prevL = 0;
+    this.prevR = 0;
+    this.level = 0;
+    this.lastAttack = -Infinity;
+    this.attacks = [];
+  }
+
+  push(l, r, n) {
+    for (let i = 0; i < n; i++) {
+      const dl = l[i] - this.prevL, dr = r[i] - this.prevR;
+      this.prevL = l[i];
+      this.prevR = r[i];
+      this.frameAcc += dl * dl + dr * dr;
+      if (++this.frameFill < this.frameLen) continue;
+      const e = this.frameAcc / this.frameLen;
+      const start = this.written + i + 1 - this.frameLen - this.lead;
+      if (e > ATTACK_RATIO * this.level && e > ATTACK_FLOOR && start - this.lastAttack >= this.gap) {
+        this.attacks.push(start);
+        this.lastAttack = start;
+      }
+      this.level += this.alpha * (e - this.level);
+      this.frameAcc = 0;
+      this.frameFill = 0;
+    }
+    this.written += n;
+  }
+
+  /** True if an attack starts in [from, to), absolute positions. */
+  any(from, to) {
+    // Sorted, and below 1x the unread backlog, and so this list, keeps growing.
+    for (const a of this.attacks) {
+      if (a >= to) return false;
+      if (a >= from) return true;
+    }
+    return false;
+  }
+
+  /** Forget attacks the chain has consumed past. */
+  drop(before) {
+    let k = 0;
+    while (k < this.attacks.length && this.attacks[k] < before) k++;
+    if (k) this.attacks.splice(0, k);
+  }
+}
+
 /**
  * One WSOLA time-stretch chain: stereo in, stereo out, its own buffers.
  *
@@ -183,7 +280,13 @@ const BUTTERWORTH_Q8 = [0.50979558, 0.60134489, 0.89997622, 2.56291545];
  * folding, only attenuate whatever the fold produced.
  */
 class Wsola {
-  constructor(sr) {
+  /**
+   * `keepAttacks` must stay off for the pitch stages. Borrowing moves a chain's
+   * clock, and a pitch chain is aligned sample for sample with the unpitched
+   * drums beside it, so there it would pull the band away from the kit. It is
+   * safe on the shared tempo stage only because everything shares that clock.
+   */
+  constructor(sr, { keepAttacks = false } = {}) {
     this.ovLen   = Math.round(OVERLAP_MS  * sr / 1000);
     this.seekLen = Math.round(SEEK_MS     * sr / 1000);
     this.seqLen  = Math.round(SEQUENCE_MS * sr / 1000);
@@ -209,6 +312,12 @@ class Wsola {
     this._primed = false;
 
     this.postFilter = null;
+
+    this._attacks = keepAttacks ? new AttackTracker(sr) : null;
+    this._maxBorrow = Math.round(MAX_BORROW_MS * sr / 1000);
+    this._head = 0;         // absolute position of inL's read head
+    this._borrowed = 0;     // input consumed ahead of the nominal clock
+    this._continue = false; // next sequence starts exactly where this one ended
   }
 
   clear() {
@@ -217,11 +326,23 @@ class Wsola {
     this._carryL.fill(0); this._carryR.fill(0);
     this._advanceRem = 0;
     this._primed = false;
+    this._attacks?.clear();
+    this._head = 0;
+    this._borrowed = 0;
+    this._continue = false;
   }
 
   push(l, r, n) {
     this.inL.push(l, 0, n);
     this.inR.push(r, 0, n);
+    this._attacks?.push(l, r, n);
+  }
+
+  _consume(n) {
+    this.inL.consume(n);
+    this.inR.consume(n);
+    this._head += n;
+    this._attacks?.drop(this._head);
   }
 
   /** Run sequences until `want` output samples are queued, or input runs out. */
@@ -236,7 +357,10 @@ class Wsola {
   _sequence(tempo) {
     const ovLen = this.ovLen, midLen = this.midLen, seqLen = this.seqLen;
     const outLen = ovLen + midLen;
-    const bestOff = findBestOffset(this._carryL, ovLen, this.inL, this.seekLen);
+    // After carrying straight on, the carry is the very samples at the head,
+    // so offset 0 splices them onto themselves. A search could land elsewhere.
+    const bestOff = this._continue ? 0 : findBestOffset(this._carryL, ovLen, this.inL, this.seekLen);
+    this._continue = false;
 
     for (let i = 0; i < ovLen; i++) {
       const w = i / ovLen;
@@ -257,14 +381,32 @@ class Wsola {
     this.outL.push(this._tmpL, 0, outLen);
     this.outR.push(this._tmpR, 0, outLen);
 
-    const exact = (seqLen - ovLen) * tempo + this._advanceRem;
+    const nominal = (seqLen - ovLen) * tempo;
+    const repay = this._attacks ? Math.min(this._borrowed, nominal * REPAY_SHARE) : 0;
+    const exact = nominal - repay + this._advanceRem;
     const whole = Math.floor(exact);
+
+    // Input this sequence played in full ends at `played`; the carry after it
+    // is faded out under the next sequence's head. The next sequence starts no
+    // earlier than `whole`, so an attack in between would be heard twice.
+    if (this._attacks && tempo < 1) {
+      const played = bestOff + outLen;
+      const cost = played - nominal;
+      if (this._borrowed + cost <= this._maxBorrow
+        && this._attacks.any(this._head + whole, this._head + played + ovLen)) {
+        this._borrowed += cost;
+        this._continue = true;
+        this._consume(played);
+        return;
+      }
+    }
+
+    this._borrowed -= repay;
     this._advanceRem = exact - whole;
     // The similarity search is local to this sequence. Folding bestOff into
     // the nominal advance makes content-dependent offsets accumulate into a
     // clock error, which is especially audible against unpitched drums.
-    this.inL.consume(whole);
-    this.inR.consume(whole);
+    this._consume(whole);
   }
 }
 
@@ -459,7 +601,7 @@ class SoundTouchProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this._tempo = new Wsola(sampleRate);
+    this._tempo = new Wsola(sampleRate, { keepAttacks: true });
     // Silence every bus is primed with, before its own alignment pad, so they
     // share one clock and each chain can produce from its first block.
     this._commonPrime = this._tempo.needed + PRIME_CUSHION;
