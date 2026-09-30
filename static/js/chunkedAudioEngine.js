@@ -190,6 +190,7 @@ import {
 } from "./pitchBus.js";
 import { createPlaybackContext } from "./audioContext.js";
 import { createTickLoop } from "./tickLoop.js";
+import { loadStretchWorklet, pipelineLatencySeconds as stretchLatency } from "./tempoStage.js";
 
 export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {}) {
   const AC = window.AudioContext || window.webkitAudioContext;
@@ -226,15 +227,22 @@ export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {
   // Reported by the processor, because deriving it here would mean keeping a
   // copy of its buffering constants in sync by hand.
   let _workletLatencyFrames = 0;
+  // Which tempo stage the processor is running, and its latency (#729).
+  let _tempoStage = null;
   const _workletReady = (ctx.audioWorklet
-    ? ctx.audioWorklet.addModule('/vendor/soundtouch-processor.js').then(() => {
+    ? loadStretchWorklet(ctx.audioWorklet).then(() => {
         stNode = new AudioWorkletNode(ctx, 'soundtouch-processor', {
           numberOfInputs: INPUT_COUNT,
           numberOfOutputs: 1,
           outputChannelCount: [2],
         });
         stNode.port.onmessage = (event) => {
-          if (event?.data?.type === 'latency') _workletLatencyFrames = event.data.frames || 0;
+          const data = event?.data;
+          if (data?.type === 'latency') _workletLatencyFrames = data.frames || 0;
+          else if (data?.type === 'tempoStage') _tempoStage = data;
+          else if (data?.type === 'tempoStageFailed') {
+            console.warn('[tempoStage] Signalsmith core failed to start, keeping WSOLA:', data.message);
+          }
         };
         // The worklet loads asynchronously, so anything set before it arrived
         // would otherwise be dropped. Re-apply the current value now.
@@ -335,12 +343,6 @@ export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {
   // schedule chunk 0 without an async await after ready() completes.
   const _cache = new Map();
 
-  const _wsolaLatencySeconds = () => {
-    const needed = Math.round(0.012 * ctx.sampleRate)
-      + Math.round(0.028 * ctx.sampleRate)
-      + Math.round(0.082 * ctx.sampleRate);
-    return Math.floor(needed / 128) * 128 / ctx.sampleRate;
-  };
   const _anyLaneTransposed = () => {
     for (const stem of stemMap.values()) {
       if (effectivePitch(stem.name, stem.pitch, stem.pitchable) !== 0) return true;
@@ -349,11 +351,13 @@ export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {
   };
   const _pipelineLatencySeconds = () => {
     if (!stNode) return 0;
-    // The pitch buses only buffer once something is actually transposed. Until
-    // then the worklet hands its input straight back, with no delay to correct.
-    const pitchLatency = _anyLaneTransposed() ? _workletLatencyFrames / ctx.sampleRate : 0;
-    const tempoStages = Math.abs(_playbackRate - 1) >= 1e-3 ? 1 : 0;
-    return pitchLatency + tempoStages * _wsolaLatencySeconds();
+    return stretchLatency({
+      workletFrames: _workletLatencyFrames,
+      stage: _tempoStage,
+      rate: _playbackRate,
+      transposed: _anyLaneTransposed(),
+      sampleRate: ctx.sampleRate,
+    });
   };
 
   // Ducking either side of a bus change. Both buses are delayed by the same
@@ -603,7 +607,13 @@ export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {
     // loop.start when the playhead crosses it (bounded by one rAF frame).
     const limit = (loop.enabled && loop.end > loop.start) ? loop.end : _duration;
     if (_scheduledTo >= limit) return;
-    if (_scheduledTo - _getCurrentTime() < LOOKAHEAD_SEC) {
+    // Measured against the sources, not the output playhead. With SoundTouch
+    // stretching, sources play at 1x and the worklet buffers the surplus, so
+    // below 1x the output playhead falls behind what the sources have used up.
+    // Gating on it overstated the margin by (1 - rate) seconds every second
+    // until the sources ran dry and the next chunk landed late and skipped
+    // (#722). In the tape-effect fallback the two clocks agree.
+    if (_scheduledTo - ctxTimeToSourceTime(ctx.currentTime) < LOOKAHEAD_SEC) {
       _filling = true;
       _scheduleNext().finally(() => { _filling = false; });
     }

@@ -915,7 +915,9 @@ def download_logs_zip() -> StreamingResponse:
 # Content-Security-Policy. Defense-in-depth so an injected string in the webview
 # can't run script (and, in the desktop app, reach the exposed Tauri IPC) — #171.
 # script-src has no 'unsafe-inline'/'eval': all JS is same-origin modules and the
-# inline scripts/onclick were moved out. 'unsafe-inline' is allowed for *styles*
+# inline scripts/onclick were moved out. 'wasm-unsafe-eval' lets WebAssembly
+# compile, which the Signalsmith tempo stage in the audio worklet needs (#729);
+# it does not re-enable JS eval, new Function or string timers. 'unsafe-inline' is allowed for *styles*
 # only (the UI sets many style attributes). Allowances:
 #   connect-src  -> same-origin API/SSE, the GitHub update check, Tauri IPC,
 #                   Wikidata/Wikipedia for the artist box the now-playing card
@@ -926,7 +928,7 @@ def download_logs_zip() -> StreamingResponse:
 #   style/font   -> the Google Fonts <link>
 _CSP = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    "script-src 'self' 'wasm-unsafe-eval'; "
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com data:; "
     "img-src 'self' data: blob: https:; "
