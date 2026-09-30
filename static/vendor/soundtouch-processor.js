@@ -410,6 +410,99 @@ class Wsola {
   }
 }
 
+// The shared tempo stage, when the Signalsmith core loaded (#729).
+//
+// WSOLA slows audio down by repeating overlapping fragments of it, which is
+// heard as an echo on anything sustained. Signalsmith Stretch works in the
+// frequency domain and repeats nothing. 40 ms blocks were chosen by ear against
+// 30, 60 and the library's 120 ms default: 120 softened a quarter of the drum
+// attacks in a full mix, 30 blurred the low end.
+const SIGNALSMITH_BLOCK_MS    = 40;
+const SIGNALSMITH_INTERVAL_MS = 10;
+// Largest input one render quantum can ask for is 128 * the tempo maximum.
+const SIGNALSMITH_MAX_BLOCK   = 128 * 4;
+
+/**
+ * The same shape as a Wsola chain, as far as the processor uses one: push,
+ * fill, clear and an output FIFO pair. Anything else would mean a second code
+ * path through process().
+ *
+ * The core stretches by whatever ratio it is handed, so each quantum feeds it
+ * 128 * tempo input samples for 128 output samples. The fraction carries over,
+ * so the rate is exact on average and nothing drifts against the click.
+ */
+class SignalsmithTempo {
+  constructor(core, sr) {
+    this._core = core;
+    core._main();
+    core._configure(
+      2,
+      Math.round(SIGNALSMITH_BLOCK_MS * sr / 1000),
+      Math.round(SIGNALSMITH_INTERVAL_MS * sr / 1000),
+      false,
+    );
+    core._reset();
+    this.inputLatency = core._inputLatency();
+    this.outputLatency = core._outputLatency();
+    this._len = SIGNALSMITH_MAX_BLOCK;
+    this._ptr = core._setBuffers(2, this._len);
+    this._heap = null;
+    this.inL = new FloatFifo();
+    this.inR = new FloatFifo();
+    this.outL = new FloatFifo();
+    this.outR = new FloatFifo();
+    this._carry = 0;
+  }
+
+  // Views onto the core's buffers, rebuilt only if its memory was replaced.
+  _views() {
+    const buffer = this._core.HEAP8.buffer;
+    if (!this._heap || this._heap.buffer !== buffer) {
+      this._heap = new Float32Array(buffer, this._ptr, this._len * 4);
+    }
+    return this._heap;
+  }
+
+  clear() {
+    this.inL.clear(); this.inR.clear();
+    this.outL.clear(); this.outR.clear();
+    this._core._reset();
+    this._carry = 0;
+  }
+
+  push(l, r, n) {
+    this.inL.push(l, 0, n);
+    this.inR.push(r, 0, n);
+  }
+
+  fill(tempo, want) {
+    const block = 128;
+    while (this.outL.avail < want) {
+      const exact = block * tempo + this._carry;
+      const take = Math.min(Math.floor(exact), this._len);
+      if (this.inL.avail < take) return;
+      this._carry = exact - take;
+      const heap = this._views();
+      const len = this._len;
+      for (let i = 0; i < take; i++) {
+        heap[i] = this.inL.peek(i);
+        heap[len + i] = this.inR.peek(i);
+      }
+      this.inL.consume(take);
+      this.inR.consume(take);
+      this._core._process(take, block);
+      const out = this._views();
+      this.outL.push(out, 2 * len, block);
+      this.outR.push(out, 3 * len, block);
+    }
+  }
+
+  /** Output samples between a sample entering and leaving, at this tempo. */
+  latencyFrames(tempo) {
+    return this.inputLatency / tempo + this.outputLatency;
+  }
+}
+
 /** FIFO sample at `idx`, falling back to the carried history for idx < 0. */
 function sampleAt(fifo, hist, idx) {
   if (idx >= 0) return fifo.peek(idx);
@@ -601,10 +694,15 @@ class SoundTouchProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this._tempo = new Wsola(sampleRate, { keepAttacks: true });
+    // WSOLA stays as the tempo stage until the Signalsmith core is ready, and
+    // for good if it never is: a browser without WebAssembly in worklets, or a
+    // CSP that blocks it. Its sizes also set the priming below either way.
+    this._wsola = new Wsola(sampleRate, { keepAttacks: true });
+    this._tempo = this._wsola;
+    this._signalsmith = null;
     // Silence every bus is primed with, before its own alignment pad, so they
     // share one clock and each chain can produce from its first block.
-    this._commonPrime = this._tempo.needed + PRIME_CUSHION;
+    this._commonPrime = this._wsola.needed + PRIME_CUSHION;
     this._chains = new Array(INPUT_COUNT).fill(null);
     this._idle = new Array(INPUT_COUNT).fill(0);
     this._unpitchedL = new FloatFifo();
@@ -629,13 +727,39 @@ class SoundTouchProcessor extends AudioWorkletProcessor {
       this.port.postMessage({
         type: 'latency',
         frames: this._commonPrime
-          + alignmentPad(this._tempo.ovLen + this._tempo.midLen, 1),
+          + alignmentPad(this._wsola.ovLen + this._wsola.midLen, 1),
+      });
+    }
+    this._reportTempoStage();
+
+    // Loaded as its own worklet module ahead of this one; see
+    // signalsmith-stretch.js. Instantiating is asynchronous, so the stage is
+    // only swapped in at the next flush, never under audio already playing.
+    const core = globalThis.SignalsmithStretchCore;
+    if (typeof core === 'function') {
+      core().then((module) => {
+        this._signalsmith = new SignalsmithTempo(module, sampleRate);
+      }).catch((err) => {
+        this.port?.postMessage({ type: 'tempoStageFailed', message: String(err?.message || err) });
       });
     }
   }
 
+  // The tempo stage's own latency, which the engine adds when tempo is not 1.
+  // Signalsmith's depends on the tempo, so it is sent as its two parts.
+  _reportTempoStage() {
+    if (!this.port) return;
+    const ss = this._tempo === this._signalsmith ? this._signalsmith : null;
+    this.port.postMessage({
+      type: 'tempoStage',
+      stage: ss ? 'signalsmith' : 'wsola',
+      inputFrames: ss ? ss.inputLatency : 0,
+      outputFrames: ss ? ss.outputLatency : 0,
+    });
+  }
+
   _primeUnpitched() {
-    const outLen = this._tempo.ovLen + this._tempo.midLen;
+    const outLen = this._wsola.ovLen + this._wsola.midLen;
     const pad = new Float32Array(this._commonPrime + alignmentPad(outLen, 1));
     this._unpitchedL.clear();
     this._unpitchedR.clear();
@@ -644,6 +768,10 @@ class SoundTouchProcessor extends AudioWorkletProcessor {
   }
 
   _flush() {
+    if (this._signalsmith && this._tempo !== this._signalsmith) {
+      this._tempo = this._signalsmith;
+      this._reportTempoStage();
+    }
     this._tempo.clear();
     this._mixFifoL.clear();
     this._mixFifoR.clear();

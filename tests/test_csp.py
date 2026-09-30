@@ -40,7 +40,11 @@ def test_connect_src_allows_the_artist_and_lyrics_hosts_and_nothing_wider():
 
 def test_script_src_stays_locked():
     # Lock #171's intent: loosening connect-src must not weaken the XSS defense.
-    script = _csp_directive("script-src")
+    script = _csp_directive("script-src").split()[1:]
     assert "'self'" in script
-    assert "unsafe-inline" not in script
-    assert "unsafe-eval" not in script
+    assert "'unsafe-inline'" not in script
+    assert "'unsafe-eval'" not in script
+    # 'wasm-unsafe-eval' compiles WebAssembly and nothing else: JS eval,
+    # new Function and string timers stay blocked. The Signalsmith tempo stage
+    # needs it (#729). Anything beyond it here is a loosening to justify.
+    assert set(script) == {"'self'", "'wasm-unsafe-eval'"}

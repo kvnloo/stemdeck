@@ -24,6 +24,7 @@ import {
 } from "./pitchBus.js";
 import { createPlaybackContext } from "./audioContext.js";
 import { createTickLoop } from "./tickLoop.js";
+import { loadStretchWorklet, pipelineLatencySeconds as stretchLatency } from "./tempoStage.js";
 
 export function createAudioEngine(stems, { onTime, onEnded, context } = {}) {
   // Mobile/iOS only starts audio from a context resumed inside a user gesture.
@@ -53,15 +54,22 @@ export function createAudioEngine(stems, { onTime, onEnded, context } = {}) {
   // Reported by the processor, because deriving it here would mean keeping a
   // copy of its buffering constants in sync by hand.
   let _workletLatencyFrames = 0;
+  // Which tempo stage the processor is running, and its latency (#729).
+  let _tempoStage = null;
   const _workletReady = (ctx.audioWorklet
-    ? ctx.audioWorklet.addModule('/vendor/soundtouch-processor.js').then(() => {
+    ? loadStretchWorklet(ctx.audioWorklet).then(() => {
         stNode = new AudioWorkletNode(ctx, 'soundtouch-processor', {
           numberOfInputs: INPUT_COUNT,
           numberOfOutputs: 1,
           outputChannelCount: [2],
         });
         stNode.port.onmessage = (event) => {
-          if (event?.data?.type === 'latency') _workletLatencyFrames = event.data.frames || 0;
+          const data = event?.data;
+          if (data?.type === 'latency') _workletLatencyFrames = data.frames || 0;
+          else if (data?.type === 'tempoStage') _tempoStage = data;
+          else if (data?.type === 'tempoStageFailed') {
+            console.warn('[tempoStage] Signalsmith core failed to start, keeping WSOLA:', data.message);
+          }
         };
         // The worklet loads asynchronously, so anything set before it arrived
         // would otherwise be dropped. Re-apply the current value now.
@@ -187,12 +195,6 @@ export function createAudioEngine(stems, { onTime, onEnded, context } = {}) {
   // (startCtxTime > ctx.currentTime), which would otherwise make this go
   // negative -- the playhead must sit still at the start until the audio enters.
   // A no-op for a normal start, where startCtxTime == the moment play() ran.
-  const wsolaLatencySeconds = () => {
-    const needed = Math.round(0.012 * ctx.sampleRate)
-      + Math.round(0.028 * ctx.sampleRate)
-      + Math.round(0.082 * ctx.sampleRate);
-    return Math.floor(needed / 128) * 128 / ctx.sampleRate;
-  };
   const anyLaneTransposed = () => {
     for (const t of tracks.values()) {
       if (t.visualOnly) continue;
@@ -202,11 +204,13 @@ export function createAudioEngine(stems, { onTime, onEnded, context } = {}) {
   };
   const pipelineLatencySeconds = () => {
     if (!stNode) return 0;
-    // The pitch buses only buffer once something is actually transposed. Until
-    // then the worklet hands its input straight back, with no delay to correct.
-    const pitchLatency = anyLaneTransposed() ? _workletLatencyFrames / ctx.sampleRate : 0;
-    const tempoStages = Math.abs(_playbackRate - 1) >= 1e-3 ? 1 : 0;
-    return pitchLatency + tempoStages * wsolaLatencySeconds();
+    return stretchLatency({
+      workletFrames: _workletLatencyFrames,
+      stage: _tempoStage,
+      rate: _playbackRate,
+      transposed: anyLaneTransposed(),
+      sampleRate: ctx.sampleRate,
+    });
   };
   const now = () => playing
     ? Math.max(

@@ -141,7 +141,7 @@ check(
 // Borrowing moves a chain's clock. The pitch stages are aligned sample for
 // sample with the unpitched drums, so only the shared tempo stage may do it.
 const enabled = [...SRC.matchAll(/new Wsola\([^)]*keepAttacks: true/g)].length;
-const tempoStage = /this\._tempo = new Wsola\(sampleRate, \{ keepAttacks: true \}\)/.test(SRC);
+const tempoStage = /this\._wsola = new Wsola\(sampleRate, \{ keepAttacks: true \}\)/.test(SRC);
 check('only the shared tempo stage keeps attacks', enabled === 1 && tempoStage, `enabled in ${enabled} places`);
 
 console.log(`\n${passed}/${passed + failed} checks passed`);

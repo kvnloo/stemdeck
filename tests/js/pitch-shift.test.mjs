@@ -619,7 +619,7 @@ const Proc = load();
   const starved = load(SRC
     .replace('const PRIME_CUSHION = 512;', 'const PRIME_CUSHION = 0;')
     .replace('const OUTPUT_RESERVE = 512;', 'const OUTPUT_RESERVE = 0;')
-    .replace('this._commonPrime = this._tempo.needed + PRIME_CUSHION;', 'this._commonPrime = 0;'));
+    .replace('this._commonPrime = this._wsola.needed + PRIME_CUSHION;', 'this._commonPrime = 0;'));
   let starvedPartials = 0;
   for (const [pitch, tempo] of [[2, 1], [-2, 1], [5, 1], [-5, 1]]) {
     starvedPartials += artefacts(starved, pitch, tempo).partial;
