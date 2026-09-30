@@ -603,7 +603,13 @@ export function createChunkedAudioEngine(stems, { onTime, onEnded, context } = {
     // loop.start when the playhead crosses it (bounded by one rAF frame).
     const limit = (loop.enabled && loop.end > loop.start) ? loop.end : _duration;
     if (_scheduledTo >= limit) return;
-    if (_scheduledTo - _getCurrentTime() < LOOKAHEAD_SEC) {
+    // Measured against the sources, not the output playhead. With SoundTouch
+    // stretching, sources play at 1x and the worklet buffers the surplus, so
+    // below 1x the output playhead falls behind what the sources have used up.
+    // Gating on it overstated the margin by (1 - rate) seconds every second
+    // until the sources ran dry and the next chunk landed late and skipped
+    // (#722). In the tape-effect fallback the two clocks agree.
+    if (_scheduledTo - ctxTimeToSourceTime(ctx.currentTime) < LOOKAHEAD_SEC) {
       _filling = true;
       _scheduleNext().finally(() => { _filling = false; });
     }
