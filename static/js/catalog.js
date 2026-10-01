@@ -942,6 +942,41 @@ function syncTrashToServer(trackId, trashed) {
     .catch((e) => console.warn(`[catalog] could not ${action} ${trackId} on the server`, e));
 }
 
+/**
+ * Tell the server a track was favourited or taken back out (#734).
+ *
+ * The server holds the answer the phone reads, and the phone can change it, so
+ * this side adopts the server's value on every sync (applyServerFavorite) and
+ * only says something when the user presses a heart here. Not awaited, for the
+ * same reason as the Trash: a heart must answer at once.
+ */
+function syncFavoriteToServer(trackId, favorite) {
+  fetch(`/api/jobs/${encodeURIComponent(trackId)}/favorite`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ favorite }),
+  }).catch((e) => console.warn(`[catalog] could not save the favourite for ${trackId}`, e));
+}
+
+/**
+ * Take the server's favourite for a track this side already knows. Returns
+ * whether anything changed here.
+ *
+ * null on the server means no client has said either way, which is every
+ * track from before favourites moved there. A heart set here then is handed up
+ * rather than dropped; anything the server does know wins, because the phone
+ * may have changed it since.
+ */
+function applyServerFavorite(track, state) {
+  if (state.favorite == null) {
+    if (track.favorite) syncFavoriteToServer(state.job_id, true);
+    return false;
+  }
+  if (Boolean(track.favorite) === state.favorite) return false;
+  track.favorite = state.favorite;
+  return true;
+}
+
 function moveTrackToTrash(trackId) {
   if (!tracks[trackId]) return;
   removeTrackFromFolders(trackId);
@@ -1056,7 +1091,7 @@ async function loadTrackIntoStudio(trackId) {
   applyStoredStemSelection(track);
   setCurrentTrack(trackId);
 
-  // The composer is an input the Split stems button submits, not a caption for
+  // The composer is an input the Extract stems button submits, not a caption for
   // the open track, so it may only ever hold something that can actually be
   // imported. A `local:` source is a file that was uploaded once and is not
   // reachable again; putting its bare filename here armed the button with a
@@ -1079,7 +1114,7 @@ async function loadTrackIntoStudio(trackId) {
     // `required` is the guard for "the button has nothing to act on", and it
     // is a blunt one: the browser refuses the submit before any handler runs,
     // so it must not be set while the button has a track to re-split. Setting
-    // it there made pressing Split stems on an upload answer "please fill out
+    // it there made pressing Extract stems on an upload answer "please fill out
     // this field" instead of separating it.
     if (importable || resplittable) urlInput.removeAttribute("required");
     else urlInput.setAttribute("required", "");
@@ -1098,7 +1133,7 @@ async function loadTrackIntoStudio(trackId) {
 }
 
 /**
- * Aim the Split stems button at a track rather than at the composer.
+ * Aim the Extract stems button at a track rather than at the composer.
  *
  * Carried on the button itself rather than in a module variable so job.js can
  * read it at submit time without the two files having to agree on an import
@@ -1429,6 +1464,7 @@ export function toggleFavorite(trackId) {
   const track = tracks[trackId];
   if (!track) return;
   track.favorite = !track.favorite;
+  syncFavoriteToServer(trackId, track.favorite);
   saveState();
   if (trackId === _currentTrackId) {
     const favBtn = document.getElementById("fav-btn");
@@ -3463,6 +3499,7 @@ async function syncWithServer() {
     for (const state of jobs) {
       const known = tracks[state.job_id];
       if (known) {
+        if (applyServerFavorite(known, state)) backfilled = true;
         // Tracks saved before the server reported a format (#690) only learn
         // it when they are opened. Taking it from here instead means the
         // whole library shows its icons at startup.
@@ -3492,11 +3529,15 @@ async function syncWithServer() {
       if (deletedIds.has(state.job_id)) continue; // hard-deleted, skip
       const track = stateMetadataToTrack(state, { id: state.job_id, status: state.status });
       track.id = state.job_id;
+      if (state.favorite) track.favorite = true;
       addTrackToLibrary(track);
     }
     if (backfilled) {
       saveState();
       render();
+      const favBtn = document.getElementById("fav-btn");
+      const current = tracks[_currentTrackId];
+      if (favBtn && current) paintFavButton(favBtn, Boolean(current.favorite));
     }
     reconcileAvailability(jobs);
   } catch (e) { console.warn("[catalog] failed to load jobs from backend:", e); }
@@ -4956,4 +4997,13 @@ export async function initCatalog() {
 
   loadCurrentVersion().finally(checkForUpdate);
   syncWithServer();
+  // A heart pressed on the phone (#734) shows here the next time this window
+  // is looked at, rather than only after a reload. At most every 15 seconds,
+  // since switching windows back and forth is not new information.
+  let lastFocusSync = Date.now();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || Date.now() - lastFocusSync < 15_000) return;
+    lastFocusSync = Date.now();
+    syncWithServer();
+  });
 }
