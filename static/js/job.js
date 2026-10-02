@@ -13,6 +13,7 @@ import { addTrackToLibrary, setCurrentTrack, updateTrackStatus, applyStemPresenc
 import { initSections } from "./sections.js";
 import { importPlaylist, looksLikePlaylist } from "./playlist.js";
 import { t } from "./i18n.js";
+import { formatKey } from "./keyLabel.js";
 
 // Playful stage label rotation (Claude-Code-style flair). The backend
 // emits truthful stage strings; we surface them in the small #job-detail
@@ -112,11 +113,11 @@ function setSubmitProcessing(processing) {
   const label = submitBtn.querySelector("span");
   // Back to the label the markup ships, not a second one that only exists
   // here. This restored t("job.process") -- "Process" -- while index.html
-  // starts the button as t("process.splitStems") -- "Split stems" -- so the
+  // starts the button as t("process.extractStems") -- "Extract stems" -- so the
   // first submit of a session renamed the button for good, on success as much
   // as on failure, and nothing put it back short of a reload or a language
   // switch (#635).
-  if (label) label.textContent = processing ? t("job.processing") : t("process.splitStems");
+  if (label) label.textContent = processing ? t("job.processing") : t("process.extractStems");
 }
 
 /** True when audio is loaded in the studio. Either engine counts: the Web Audio
@@ -329,17 +330,12 @@ export function detachForegroundJob() {
 function applyStudioSummary(state) {
   const summaryKey = document.getElementById("summary-key");
   const summaryBpm = document.getElementById("summary-bpm");
-  const summaryScale = document.getElementById("summary-scale");
-  const summaryScaleName = document.getElementById("summary-scale-name");
   const summaryConfidence = document.getElementById("summary-confidence");
-  const summaryConfidenceLabel = document.getElementById("summary-confidence-label");
   const summaryLufs = document.getElementById("summary-lufs");
   const summaryPeak = document.getElementById("summary-peak");
   const summaryDuration = document.getElementById("summary-duration");
-  if (summaryKey && state.key) summaryKey.textContent = state.key;
+  if (summaryKey && state.key) summaryKey.textContent = formatKey(state.key, state.scale, t);
   if (summaryBpm && state.bpm) summaryBpm.textContent = String(state.bpm);
-  if (summaryScale && state.scale) summaryScale.textContent = state.scale;
-  if (summaryScaleName && state.scale) summaryScaleName.textContent = state.scale;
   if (summaryLufs && state.lufs != null) summaryLufs.textContent = state.lufs.toFixed(1);
   if (summaryPeak && state.peak_db != null) summaryPeak.textContent = t("job.peakDb", { value: state.peak_db.toFixed(1) });
   if (summaryDuration && state.duration) {
@@ -355,7 +351,6 @@ function applyStudioSummary(state) {
     summaryConfidence.appendChild(confSpan);
     summaryConfidence.style.setProperty("--confidence-pct", confidence);
     summaryConfidence.classList.remove("hidden");
-    summaryConfidenceLabel?.classList.remove("hidden");
   }
   const summaryDr = document.getElementById("summary-dr");
   const summaryDrLabel = document.getElementById("summary-dr-label");

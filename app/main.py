@@ -39,6 +39,7 @@ from app.core.config import (
     available_torch_devices,
     configure_portable_environment,
     ensure_runtime_dirs,
+    torch_load_error,
 )
 from app.core.logging_setup import configure_logging
 from app.core.process import process_exists as _process_exists
@@ -393,6 +394,9 @@ def _settings_payload() -> dict[str, object]:
         "demucs_device": get_demucs_device_choice(),
         "demucs_device_resolved": get_demucs_device(),
         "demucs_devices_available": available_torch_devices(),
+        # Set when torch is installed but cannot load, which stops separation
+        # on every device (#730). Read after the probe above refreshed it.
+        "torch_error": torch_load_error(),
     }
 
 
@@ -915,18 +919,21 @@ def download_logs_zip() -> StreamingResponse:
 # Content-Security-Policy. Defense-in-depth so an injected string in the webview
 # can't run script (and, in the desktop app, reach the exposed Tauri IPC) — #171.
 # script-src has no 'unsafe-inline'/'eval': all JS is same-origin modules and the
-# inline scripts/onclick were moved out. 'unsafe-inline' is allowed for *styles*
+# inline scripts/onclick were moved out. 'wasm-unsafe-eval' lets WebAssembly
+# compile, which the Signalsmith tempo stage in the audio worklet needs (#729);
+# it does not re-enable JS eval, new Function or string timers. 'unsafe-inline' is allowed for *styles*
 # only (the UI sets many style attributes). Allowances:
 #   connect-src  -> same-origin API/SSE, the GitHub update check, Tauri IPC,
-#                   Wikidata/Wikipedia for the artist box the now-playing card
-#                   opens, and LRCLIB for the Lyrics tab (#699). All four are
-#                   read-only public APIs, asked only about the open track, and
-#                   sent only an artist and a song name.
+#                   and Wikidata/Wikipedia for the artist box the now-playing
+#                   card opens. Read-only public APIs, asked only about the
+#                   open track, and sent only an artist and a song name. Not
+#                   LRCLIB: the Lyrics tab asks the server to look lyrics up
+#                   (#719), so the page never reaches it.
 #   img-src https: -> remote YouTube/SoundCloud thumbnails
 #   style/font   -> the Google Fonts <link>
 _CSP = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    "script-src 'self' 'wasm-unsafe-eval'; "
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src 'self' https://fonts.gstatic.com data:; "
     "img-src 'self' data: blob: https:; "
@@ -936,8 +943,7 @@ _CSP = (
     # (#186). They are inline/same-origin schemes, not network endpoints, so
     # they add no exfiltration channel — script-src below stays locked.
     "connect-src 'self' https://api.github.com ipc: http://ipc.localhost data: blob: "
-    "https://www.wikidata.org https://query.wikidata.org https://*.wikipedia.org "
-    "https://lrclib.net; "
+    "https://www.wikidata.org https://query.wikidata.org https://*.wikipedia.org; "
     "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 

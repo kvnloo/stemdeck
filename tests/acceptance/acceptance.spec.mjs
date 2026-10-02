@@ -103,10 +103,9 @@ test.afterEach(async ({ app }, testInfo) => {
   if (testInfo.status === testInfo.expectedStatus) return;
   await shot(app.page, testInfo, "failure").catch(() => {});
   const message = testInfo.error?.message || "";
-  const evidence = serviceEvidence(app.page, checkStartedAt, {
-    // Blocked on purpose by E4.
-    ignoreHosts: testInfo.title.startsWith("E4") ? ["lrclib.net"] : [],
-  });
+  // E4's refused lookup is a request to the app's own server, which this does
+  // not count as an outside service.
+  const evidence = serviceEvidence(app.page, checkStartedAt);
   // An outage only explains a failure it could have caused: an import that
   // YouTube refused, or a request from the page itself that failed. A service
   // in the backend log alone is noted, not blamed.
@@ -342,7 +341,7 @@ test(title("A3"), async ({ app }, testInfo) => {
 // ─── Now playing and song details ───────────────────────────────────────────
 
 // Steps: import any song and open it. Expect, left to right: the link field,
-// the Extract options, Split stems, then the Now playing card with the
+// the Extract options, Extract stems, then the Now playing card with the
 // artwork, the heart on its left and the (i) on its right.
 test(title("N1"), async ({ app }, testInfo) => {
   const { page } = app;
@@ -367,8 +366,8 @@ test(title("N1"), async ({ app }, testInfo) => {
   // chips under the field; everything else follows them to the right.
   const besideOrUnder = url.right <= extract.left || (Math.abs(extract.left - url.left) < 40 && extract.top >= url.bottom - 2);
   expect(besideOrUnder, "the Extract options follow the link field").toBe(true);
-  expect(Math.max(url.right, extract.right) <= split.left, "Split stems follows them").toBe(true);
-  expect(split.right <= card.left, "the card comes after Split stems").toBe(true);
+  expect(Math.max(url.right, extract.right) <= split.left, "Extract stems follows them").toBe(true);
+  expect(split.right <= card.left, "the card comes after Extract stems").toBe(true);
   // One row: every one of them overlaps the card's height.
   for (const b of [url, extract, split]) expect(b.top < card.bottom && b.bottom > card.top, "one row").toBe(true);
   await expect(page.locator("#nowPlayingPanel .np-legend")).toHaveText("Now playing");
@@ -1021,16 +1020,19 @@ test(title("V2"), async ({ app }, testInfo) => {
 // Expect: "Could not reach LRCLIB. Check your connection and try again." in
 // the Lyrics panel; nothing floats over the top bar.
 //
-// LRCLIB is blocked for the page alone (page.route over CDP): the rest of the
-// machine keeps its network. The page only asks LRCLIB itself for a track the
-// server kept no lyrics for, which the tagged tone file is.
+// The page asks the server to look lyrics up (#719), and the server answers
+// 502 when LRCLIB cannot be reached. That answer is given for the page alone
+// (page.route over CDP), so the rest of the machine keeps its network. The
+// lookup is only asked for a track the server kept no lyrics for, which the
+// tagged tone file is.
 test(title("E4"), async ({ app }, testInfo) => {
   const { page } = app;
   await wideWindow(page);
   const id = await trackFor(page, "localMp3");
   const kept = await fetch(`${readState().baseURL}/api/jobs/${id}/lyrics`);
-  test.skip(kept.status !== 404, `The server kept lyrics for the tone file (HTTP ${kept.status}), so the page would not ask LRCLIB.`);
-  await page.route(/^https:\/\/lrclib\.net\//, (route) => route.abort("internetdisconnected"));
+  test.skip(kept.status !== 404, `The server kept lyrics for the tone file (HTTP ${kept.status}), so the page would not ask for a lookup.`);
+  const LOOKUP = /\/api\/jobs\/[^/]+\/lyrics\/lookup$/;
+  await page.route(LOOKUP, (route) => route.fulfill({ status: 502, json: { detail: "lyrics service unreachable" } }));
   try {
     await openTrack(page, id);
     await openLyrics(page);
@@ -1050,7 +1052,7 @@ test(title("E4"), async ({ app }, testInfo) => {
     expect(floating).toBe(0);
     await shot(page, testInfo, "offline");
   } finally {
-    await page.unroute(/^https:\/\/lrclib\.net\//);
+    await page.unroute(LOOKUP);
   }
 });
 

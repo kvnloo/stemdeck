@@ -962,33 +962,73 @@ export function wireTransportButtons() {
   wirePitchControl();
 }
 
-// Fixed presets, not a continuous dial -- practice speeds for slowing a part
-// down, not a general-purpose tempo control (issue #269 follow-up).
-// 0.75x rather than 0.5x/0.25x (#433): below ~0.7x the time-stretch artefacts
-// dominate and the part gets harder to follow, which is the opposite of what
-// a practice speed is for.
-const SPEED_PRESETS = [0.75, 1];
+// Three buttons rather than a dial -- practice speeds for slowing a part
+// down, not a general-purpose tempo control (#269 follow-up): half speed,
+// a slow speed the player sets, and normal.
+//
+// The slow one is set by the player (#701): scroll over it, or press the up
+// and down arrow keys on it, to move it a hundredth at a time between
+// SLOW_MIN and SLOW_MAX. Some fills want 0.75x, some only a nudge to 0.9x.
+// It was fixed at 0.75x when the stretch was WSOLA, whose artefacts made
+// anything slower hard to follow (#433); Signalsmith Stretch (#729) holds up
+// further down, so the floor is 0.5x. Kept between sessions, and the footer
+// keeps its width: the button only ever reads "0.xxx".
+const SLOW_MIN = 0.5;
+const SLOW_MAX = 0.99;
+const SLOW_DEFAULT = 0.75;
+const _SLOW_SPEED_KEY = "stemdeck:slow-speed";
+// A turn of the wheel fires many events; the rate itself is applied once
+// they stop, since every change of rate flushes the tempo stage.
+const SLOW_APPLY_DELAY_MS = 150;
 
-function applySpeed(rate) {
-  // Snap to the nearest preset rather than clamping continuously: every
-  // caller (button click, resetSpeed on track load) already passes one of
-  // SPEED_PRESETS, but snapping keeps this correct even if that changes.
-  const clamped = SPEED_PRESETS.reduce((best, p) =>
-    Math.abs(p - rate) < Math.abs(best - rate) ? p : best
-  );
-  setPlaybackSpeed(clamped);
-  for (const btn of speedBtns) {
-    if (!btn) continue;
-    const on = parseFloat(btn.dataset.speed) === clamped;
-    btn.classList.toggle("active", on);
-    btn.setAttribute("aria-checked", on ? "true" : "false");
+const clampSlow = (rate) => Math.round(Math.min(SLOW_MAX, Math.max(SLOW_MIN, rate)) * 100) / 100;
+let _slowRate = SLOW_DEFAULT;
+let _slowApplyTimer = 0;
+const halfBtn = () => document.getElementById("t-speed-05");
+const slowBtn = () => document.getElementById("t-speed-075");
+const normalBtn = () => document.getElementById("t-speed-1");
+
+function paintSlowButton() {
+  const btn = slowBtn();
+  if (!btn) return;
+  btn.dataset.speed = String(_slowRate);
+  btn.textContent = `${_slowRate.toFixed(2)}x`;
+  btn.title = t("speed.slowTitle");
+}
+
+/**
+ * Play at the speed of `btn`, one of the three buttons: half, the slow speed,
+ * or normal. Without one, anything under 1 is the slow button's. The button
+ * pressed is the one lit, so half speed and a slow speed set to 0.50x never
+ * light together.
+ */
+function applySpeed(rate, btn = null) {
+  const pressed = btn ?? (rate >= 1 ? normalBtn() : slowBtn());
+  const applied = pressed === halfBtn() ? 0.5 : pressed === slowBtn() ? _slowRate : 1;
+  setPlaybackSpeed(applied);
+  for (const b of speedBtns) {
+    if (!b) continue;
+    const on = b === pressed;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-checked", on ? "true" : "false");
   }
-  audioEngine?.setPlaybackRate?.(clamped);
+  audioEngine?.setPlaybackRate?.(applied);
   if (multitrack) {
     for (const a of (multitrack.audios ?? [])) {
-      try { a.playbackRate = clamped; } catch { /* noop */ }
+      try { a.playbackRate = applied; } catch { /* noop */ }
     }
   }
+}
+
+/** Move the slow speed by `steps` hundredths, and play at it. */
+function nudgeSlowSpeed(steps) {
+  const next = clampSlow(_slowRate + steps / 100);
+  if (next === _slowRate) return;
+  _slowRate = next;
+  paintSlowButton();
+  storeSet(_SLOW_SPEED_KEY, _slowRate).catch((e) => console.warn("[transport] failed to save the slow speed:", e));
+  clearTimeout(_slowApplyTimer);
+  _slowApplyTimer = setTimeout(() => applySpeed(_slowRate, slowBtn()), SLOW_APPLY_DELAY_MS);
 }
 
 
@@ -1090,8 +1130,28 @@ export function resetSpeed() {
 
 function wireSpeedControl() {
   for (const btn of speedBtns) {
-    btn?.addEventListener("click", () => applySpeed(parseFloat(btn.dataset.speed)));
+    btn?.addEventListener("click", () => applySpeed(parseFloat(btn.dataset.speed), btn));
   }
+  const slow = slowBtn();
+  if (!slow) return;
+  paintSlowButton();
+  onLanguageChange(paintSlowButton);
+  slow.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (e.deltaY) nudgeSlowSpeed(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+  slow.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    nudgeSlowSpeed(e.key === "ArrowUp" ? 1 : -1);
+  });
+  storeGet(_SLOW_SPEED_KEY, null).then((saved) => {
+    if (typeof saved !== "number" || !Number.isFinite(saved)) return;
+    const wasSlow = slow.classList.contains("active");
+    _slowRate = clampSlow(saved);
+    paintSlowButton();
+    if (wasSlow) applySpeed(_slowRate, slow);
+  }).catch(() => {});
 }
 
 // ─── Click track ────────────────────────────────────────────

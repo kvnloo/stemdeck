@@ -270,7 +270,7 @@
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M13 2 3 14h7l-1 8 10-12h-7z"/>
             </svg>
-            <span data-i18n="process.splitStems">Split stems</span>
+            <span data-i18n="process.extractStems">Extract stems</span>
           </button>
         </form>
 
@@ -452,8 +452,6 @@
                 <div class="meta-card-main">
                   <span class="meta-card-value" id="summary-key">—</span>
                   <div class="daw-camelot-ring hidden" id="summary-confidence"></div>
-                  <span class="meta-card-sub" id="summary-scale"></span>
-                  <span class="meta-card-sub hidden" id="summary-confidence-label"></span>
                 </div>
               </div>
 
@@ -476,13 +474,6 @@
                 <span class="meta-card-label" data-i18n="meta.duration">DURATION</span>
                 <div class="meta-card-main">
                   <span class="meta-card-value num" id="summary-duration">—</span>
-                </div>
-              </div>
-
-              <div class="daw-meta-card" data-meta="scale">
-                <span class="meta-card-label" data-i18n="meta.scale">SCALE</span>
-                <div class="meta-card-main">
-                  <span class="meta-card-value" id="summary-scale-name">—</span>
                 </div>
               </div>
 
@@ -880,6 +871,7 @@
             <span class="footer-group-label" data-i18n="speed.group">Speed</span>
             <div class="footer-group-body">
               <div class="footer-seg speed-group" id="t-speed-wrap" role="radiogroup" aria-label="Playback speed" data-i18n-aria-label="speed.ariaLabel">
+                <button class="speed-btn" id="t-speed-05" type="button" role="radio" aria-checked="false" data-speed="0.5">0.5x</button>
                 <button class="speed-btn" id="t-speed-075" type="button" role="radio" aria-checked="false" data-speed="0.75">0.75x</button>
                 <button class="speed-btn active" id="t-speed-1" type="button" role="radio" aria-checked="true" data-speed="1">1x</button>
               </div>

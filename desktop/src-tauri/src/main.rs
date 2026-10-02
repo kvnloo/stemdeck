@@ -1,6 +1,8 @@
 mod certs;
 mod dragout;
 mod dropin;
+#[cfg(any(not(target_os = "macos"), test))]
+mod torchswap;
 
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -1945,6 +1947,27 @@ fn ensure_torch_device(
 
     #[cfg(not(target_os = "macos"))]
     {
+        let site = torch_site_packages(&python);
+        if site.is_none() {
+            append_to_setup_log(
+                &data_dir,
+                "could not locate site-packages; torch swaps overlay",
+            );
+        }
+        // A swap that was interrupted (crash, forced quit, a rollback that did
+        // not finish) is put back before anything else looks at torch.
+        if let Some(site) = site.as_deref().filter(|s| torchswap::has_backup(s)) {
+            match torchswap::restore(site) {
+                Ok(()) => append_to_setup_log(
+                    &data_dir,
+                    "restored the bundled torch left aside by an interrupted swap",
+                ),
+                Err(e) => append_to_setup_log(
+                    &data_dir,
+                    &format!("could not restore an interrupted torch swap ({e})"),
+                ),
+            }
+        }
         let setup = match detect_nvidia_gpu(&data_dir) {
             Some((gpu_name, cuda_version, compute_cap)) => {
                 // Try each candidate wheel in turn. A build that installs but
@@ -1959,7 +1982,20 @@ fn ensure_torch_device(
                 // reads in a bug report and sends them after the wrong thing
                 // (#502: the install had been killed mid-download).
                 let mut cuda_installed = false;
-                for tag in &candidates {
+                // One entry per candidate tried: None when it did not install,
+                // otherwise what verification said. Decides the reason below.
+                let mut outcomes: Vec<Option<CudaVerify>> = Vec::new();
+                // Whether the bundled torch was moved aside, so a failure can
+                // put exactly it back (#731).
+                let mut swapped = false;
+                // A re-run (a new app version) on a CUDA build that already
+                // works has nothing to install.
+                let already = verify_cuda_torch(&python) == CudaVerify::Verified;
+                if already {
+                    append_to_setup_log(&data_dir, "CUDA torch already installed and verified");
+                    cuda_verified = true;
+                }
+                for tag in candidates.iter().filter(|_| !already) {
                     append_to_setup_log(
                         &data_dir,
                         &format!(
@@ -1967,13 +2003,41 @@ fn ensure_torch_device(
                             torch_version_for_tag(tag)
                         ),
                     );
+                    // Each build goes into clean directories. The first moves
+                    // the bundled torch aside; later ones clear the build
+                    // before them, so no build is laid over another.
+                    if let Some(site) = &site {
+                        if !swapped {
+                            match torchswap::snapshot(site) {
+                                Ok(n) => {
+                                    swapped = true;
+                                    append_to_setup_log(
+                                        &data_dir,
+                                        &format!("moved the bundled torch aside ({n} entries)"),
+                                    );
+                                }
+                                Err(e) => append_to_setup_log(
+                                    &data_dir,
+                                    &format!("could not move the bundled torch aside ({e}); installing over it"),
+                                ),
+                            }
+                        } else if let Err(e) = torchswap::discard_installed(site) {
+                            append_to_setup_log(
+                                &data_dir,
+                                &format!("could not clear the previous CUDA build ({e})"),
+                            );
+                        }
+                    }
                     let index_url = format!("https://download.pytorch.org/whl/{tag}");
                     if let Err(e) = install_cuda_torch(&python, &index_url, &state, &app) {
                         append_to_setup_log(&data_dir, &format!("{tag} install failed: {e}"));
+                        outcomes.push(None);
                         continue;
                     }
                     cuda_installed = true;
-                    if verify_cuda_torch(&python) {
+                    let outcome = verify_cuda_torch(&python);
+                    outcomes.push(Some(outcome));
+                    if outcome == CudaVerify::Verified {
                         append_to_setup_log(&data_dir, &format!("{tag} verified"));
                         cuda_verified = true;
                         break;
@@ -1981,19 +2045,32 @@ fn ensure_torch_device(
                     append_to_setup_log(&data_dir, &format!("{tag} installed but did not verify"));
                 }
                 let reason = if cuda_verified {
+                    if swapped {
+                        if let Some(site) = &site {
+                            if let Err(e) = torchswap::commit(site) {
+                                append_to_setup_log(
+                                    &data_dir,
+                                    &format!("could not delete the torch backup ({e})"),
+                                );
+                            }
+                        }
+                    }
                     "verified"
                 } else {
                     // CUDA torch is installed but unusable. Falling back to the
                     // "cpu" device is not enough — app/main.py imports torch at
                     // module scope, so a wheel that cannot load keeps the
                     // backend from starting at all. Put the CPU wheels back
-                    // (#324).
-                    let stage = if cuda_installed {
-                        "cuda-verify-failed"
-                    } else {
-                        "cuda-install-failed"
-                    };
-                    match restore_cpu_torch(&python, &state, &app) {
+                    // (#324), and check they import (#731).
+                    let stage = cuda_failure_stage(&outcomes);
+                    match put_cpu_torch_back(
+                        &python,
+                        site.as_deref(),
+                        swapped,
+                        &state,
+                        &app,
+                        &data_dir,
+                    ) {
                         Ok(()) => stage,
                         Err(e) => {
                             append_to_setup_log(
@@ -2325,13 +2402,23 @@ fn wheel_tag(compute_cap: Option<&str>, cuda_version: &str) -> &'static str {
 /// on the GPU and then fail at separation time.
 #[cfg(any(not(target_os = "macos"), test))]
 fn wheel_candidates(compute_cap: Option<&str>, cuda_version: &str) -> Vec<&'static str> {
-    let blackwell = compute_cap
-        .and_then(|cap| cap.split('.').next()?.parse::<u32>().ok())
-        .is_some_and(|major| major >= 10);
+    let cap_major = compute_cap.and_then(|cap| cap.split('.').next()?.parse::<u32>().ok());
+    let blackwell = cap_major.is_some_and(|major| major >= 10);
     if blackwell {
         return vec!["cu128"];
     }
+    // torch 2.8 (cu128) dropped Maxwell and Pascal: its Windows builds start
+    // at sm_61 and its Linux builds at sm_70 (TORCH_CUDA_ARCH_LIST in
+    // pytorch's release/2.8 .ci scripts). The 2.6 line keeps sm_50 in both
+    // cu124 and cu118, and an sm_50 binary runs on any 5.x card. A GTX 970
+    // under a CUDA 13 driver was offered cu128 alone, failed verification with
+    // "no kernel image is available", and dropped to CPU (#732).
+    let pre_volta = cap_major.is_some_and(|major| major < 7);
     match cuda_tag(cuda_version) {
+        "cu128" if pre_volta => vec!["cu124", "cu118"],
+        // A CUDA 13 driver runs the 2.6 builds too, so they are a second
+        // chance when cu128 installs but does not verify.
+        "cu128" => vec!["cu128", "cu124", "cu118"],
         // cu118 as a second chance for a CUDA 12 driver. cu124 is the right
         // first answer for all of them (see cuda_tag), but minor-version
         // compatibility is the thing being relied on there, and when it does
@@ -2912,6 +2999,99 @@ fn restore_cpu_torch(
     )
 }
 
+/// The site-packages this Python installs into, asked of the interpreter
+/// itself rather than assumed from the layout, which differs between the
+/// Windows and Linux bundles and the downloaded runtime pack.
+#[cfg(not(target_os = "macos"))]
+fn torch_site_packages(python: &Path) -> Option<PathBuf> {
+    let mut command = Command::new(python);
+    command
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command);
+    let out = command_output_with_timeout(command, Duration::from_secs(60), "site-packages probe")
+        .ok()
+        .filter(|out| out.status.success())?;
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    path.is_dir().then_some(path)
+}
+
+/// Whether `import torch` works. A restore that leaves torch unimportable is
+/// a failed restore, whatever pip said (#731).
+#[cfg(not(target_os = "macos"))]
+fn verify_torch_imports(python: &Path) -> Result<(), String> {
+    let mut command = Command::new(python);
+    command
+        .args(["-c", "import torch"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    hide_console_window(&mut command);
+    let out = command_output_with_timeout(command, GPU_VERIFY_TIMEOUT, "torch import check")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let tail: Vec<&str> = stderr.trim().lines().rev().take(3).collect();
+    Err(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+}
+
+/// Put CPU torch back after CUDA did not work out, and prove it imports.
+///
+/// With the bundled torch moved aside, that is a rename back: exact, and no
+/// network. Without one (the move failed, or the install broke before this
+/// fix existed and has no backup), the CPU wheels are reinstalled, and if
+/// torch still cannot import, everything torch owns is deleted and they are
+/// installed once more into clean directories. That second pass is what
+/// repairs an install already carrying a stray CUDA DLL (#723).
+#[cfg(not(target_os = "macos"))]
+fn put_cpu_torch_back(
+    python: &Path,
+    site: Option<&Path>,
+    swapped: bool,
+    state: &BackendState,
+    app: &tauri::AppHandle,
+    data_dir: &Path,
+) -> Result<(), String> {
+    if let (true, Some(site)) = (swapped, site) {
+        match torchswap::restore(site) {
+            Ok(()) => match verify_torch_imports(python) {
+                Ok(()) => {
+                    append_to_setup_log(data_dir, "put the bundled torch back");
+                    return Ok(());
+                }
+                Err(e) => append_to_setup_log(
+                    data_dir,
+                    &format!("the restored torch does not import:\n{e}"),
+                ),
+            },
+            Err(e) => append_to_setup_log(
+                data_dir,
+                &format!("could not put the bundled torch back ({e})"),
+            ),
+        }
+    }
+    restore_cpu_torch(python, state, app)?;
+    let Err(first) = verify_torch_imports(python) else {
+        return Ok(());
+    };
+    append_to_setup_log(
+        data_dir,
+        &format!("CPU torch reinstalled over the old files but does not import:\n{first}"),
+    );
+    let site = site.ok_or("torch does not import and site-packages is unknown")?;
+    torchswap::discard_installed(site)
+        .map_err(|e| format!("could not clear the broken torch ({e})"))?;
+    restore_cpu_torch(python, state, app)?;
+    verify_torch_imports(python)
+        .map_err(|e| format!("CPU torch does not import after a clean reinstall:\n{e}"))?;
+    append_to_setup_log(data_dir, "CPU torch reinstalled into clean directories");
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn install_cuda_torch(
     python: &Path,
@@ -2919,11 +3099,9 @@ fn install_cuda_torch(
     state: &BackendState,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
-    // Skip only when CUDA torch is already active — torch.version.cuda is
-    // None for CPU-only wheels, so this correctly re-installs when needed.
-    if verify_cuda_torch(python) {
-        return Ok(());
-    }
+    // Whether a working CUDA build is already installed is decided once, by
+    // the caller, before any build is moved aside: asked here, after the
+    // bundled torch has been moved, it would always say no.
 
     // Fix the build machine's Python path baked into pyvenv.cfg before pip
     // runs — pip validates the `home` entry and fails if it doesn't exist.
@@ -3015,8 +3193,49 @@ fn cuda_install_passes<'a>(
 /// an unbounded wait is an unbounded hang (#502).
 const GPU_VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// What a CUDA verification run showed.
+#[cfg(any(not(target_os = "macos"), test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaVerify {
+    Verified,
+    /// The build has no kernels for this GPU. Another build might, but trying
+    /// the same builds again on the next launch never will (#733).
+    NoKernelImage,
+    /// Anything else, including a timeout. Worth retrying next launch.
+    Failed,
+}
+
+/// Whether a failed verification was the "this build has no kernels for your
+/// GPU" error. Matched on CUDA's exact wording, because a looser match would
+/// settle a driver or install problem as permanent.
+#[cfg(any(not(target_os = "macos"), test))]
+fn is_no_kernel_image(stderr: &str) -> bool {
+    stderr.contains("no kernel image is available for execution on the device")
+}
+
+/// The reason recorded when CUDA setup does not end on the GPU.
+///
+/// `cuda-unsupported-gpu` means every build that installed was refused for
+/// having no kernels for this card, and nothing else went wrong. The setup
+/// screen treats it as settled, so the same builds are not downloaded and
+/// refused again on every launch (#733). A new app version re-runs setup
+/// anyway, which is when different builds could be on offer.
+#[cfg(any(not(target_os = "macos"), test))]
+fn cuda_failure_stage(outcomes: &[Option<CudaVerify>]) -> &'static str {
+    let installed: Vec<CudaVerify> = outcomes.iter().flatten().copied().collect();
+    if installed.is_empty() {
+        "cuda-install-failed"
+    } else if installed.len() == outcomes.len()
+        && installed.iter().all(|o| *o == CudaVerify::NoKernelImage)
+    {
+        "cuda-unsupported-gpu"
+    } else {
+        "cuda-verify-failed"
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
-fn verify_cuda_torch(python: &Path) -> bool {
+fn verify_cuda_torch(python: &Path) -> CudaVerify {
     // Don't trust torch.cuda.is_available() alone: it returns True even when the
     // installed wheel has no kernels for the device (e.g. sm_120 on a cu124
     // build), which then crashes mid-extraction with "no kernel image is
@@ -3050,7 +3269,7 @@ fn verify_cuda_torch(python: &Path) -> bool {
     };
 
     match command_output_with_timeout(command, GPU_VERIFY_TIMEOUT, "CUDA verify") {
-        Ok(out) if out.status.success() => true,
+        Ok(out) if out.status.success() => CudaVerify::Verified,
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.trim().is_empty() {
@@ -3060,7 +3279,11 @@ fn verify_cuda_torch(python: &Path) -> bool {
                 // torch loaded but reported no usable device.
                 log("CUDA verify failed: torch reported no usable CUDA device");
             }
-            false
+            if is_no_kernel_image(&stderr) {
+                CudaVerify::NoKernelImage
+            } else {
+                CudaVerify::Failed
+            }
         }
         Err(e) => {
             // The timeout path lands here, and it is the one worth naming
@@ -3071,7 +3294,7 @@ fn verify_cuda_torch(python: &Path) -> bool {
                  and falling back to CPU. A driver that does not match the installed \
                  CUDA wheel is the usual cause."
             ));
-            false
+            CudaVerify::Failed
         }
     }
 }
@@ -6211,6 +6434,84 @@ mod tests {
         assert_eq!(super::wheel_candidates(None, "11.8"), vec!["cu118"]);
     }
 
+    /// The reporter's GTX 970 (sm_52) under a CUDA 13 driver (#723, #732).
+    /// torch 2.8's cu128 builds have no kernels below sm_61 on Windows or
+    /// sm_70 on Linux, so every pre-Volta card goes to the 2.6 builds.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_pre_volta_card_is_never_offered_cu128() {
+        for cap in ["5.0", "5.2", "6.0", "6.1", "6.2"] {
+            for driver in ["13.0", "12.8", "12.4", "11.8"] {
+                let tags = super::wheel_candidates(Some(cap), driver);
+                assert!(
+                    !tags.is_empty(),
+                    "cap {cap}, driver {driver}: nothing offered"
+                );
+                assert!(
+                    !tags.contains(&"cu128"),
+                    "cap {cap}, driver {driver}: offered {tags:?}"
+                );
+            }
+        }
+        assert_eq!(
+            super::wheel_candidates(Some("5.2"), "13.0"),
+            vec!["cu124", "cu118"]
+        );
+    }
+
+    /// The reporter's setup log: the GPU was refused by every build for having
+    /// no kernels, and setup repeated the whole install on each of six
+    /// launches (#733). That outcome, and only that one, is settled.
+    #[test]
+    fn a_gpu_every_build_refuses_is_settled_as_unsupported() {
+        use super::CudaVerify::{Failed, NoKernelImage, Verified};
+        let stage = super::cuda_failure_stage;
+        assert_eq!(stage(&[Some(NoKernelImage)]), "cuda-unsupported-gpu");
+        assert_eq!(
+            stage(&[Some(NoKernelImage), Some(NoKernelImage)]),
+            "cuda-unsupported-gpu"
+        );
+        // Anything that might go differently next time is not settled.
+        assert_eq!(
+            stage(&[Some(NoKernelImage), Some(Failed)]),
+            "cuda-verify-failed"
+        );
+        assert_eq!(stage(&[Some(NoKernelImage), None]), "cuda-verify-failed");
+        assert_eq!(stage(&[Some(Failed)]), "cuda-verify-failed");
+        assert_eq!(stage(&[None, None]), "cuda-install-failed");
+        assert_eq!(stage(&[]), "cuda-install-failed");
+        // Verified never reaches here, but must not read as unsupported.
+        assert_eq!(stage(&[Some(Verified)]), "cuda-verify-failed");
+    }
+
+    #[test]
+    fn only_cudas_own_wording_counts_as_no_kernel_image() {
+        // The line from the reporter's setup.log.
+        assert!(super::is_no_kernel_image(
+            "torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device"
+        ));
+        assert!(!super::is_no_kernel_image("CUDA error: out of memory"));
+        assert!(!super::is_no_kernel_image(
+            "RuntimeError: CUDA kernel launch timed out"
+        ));
+        assert!(!super::is_no_kernel_image(""));
+    }
+
+    /// A card cu128 does support still starts there, with the 2.6 builds
+    /// behind it instead of CPU.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_cuda_13_driver_falls_back_to_the_2_6_builds() {
+        assert_eq!(
+            super::wheel_candidates(Some("8.6"), "13.0"),
+            vec!["cu128", "cu124", "cu118"]
+        );
+        assert_eq!(
+            super::wheel_candidates(None, "13.0"),
+            vec!["cu128", "cu124", "cu118"]
+        );
+    }
+
     /// Every wheel tag setup can offer publishes the torch line it installs.
     ///
     /// The tag comes from the driver and the version from a table, and nothing
@@ -6234,6 +6535,8 @@ mod tests {
         ];
         let caps = [
             None,
+            Some("5.2"),
+            Some("6.1"),
             Some("7.5"),
             Some("8.6"),
             Some("8.9"),

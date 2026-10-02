@@ -5,6 +5,7 @@ import { initSections } from "./sections.js";
 import { bpmChip, foregroundJobId, keyChip, saveSelectedStems, selectedStems, titleEl } from "./state.js";
 import { refreshStemChoiceVisuals } from "./stemChoice.js";
 import { trackFormat, formatIconSvg, paintNowPlayingArt } from "./formatIcon.js";
+import { formatKey } from "./keyLabel.js";
 import { showError, importFromUrl, detachForegroundJob, runVocalSplitIfWanted } from "./job.js";
 import {
   cancelQueuedJob, getQueueSnapshot, isPaused, onJobSettled, onQueueChange,
@@ -856,18 +857,13 @@ function applyTrackInfoToPanel(track) {
 
   const summaryKey = document.getElementById("summary-key");
   const summaryBpm = document.getElementById("summary-bpm");
-  const summaryScale = document.getElementById("summary-scale");
-  const summaryScaleName = document.getElementById("summary-scale-name");
   const summaryConfidence = document.getElementById("summary-confidence");
-  const summaryConfidenceLabel = document.getElementById("summary-confidence-label");
   const summaryLufs = document.getElementById("summary-lufs");
   const summaryPeak = document.getElementById("summary-peak");
   const summaryDuration = document.getElementById("summary-duration");
 
-  if (summaryKey) summaryKey.textContent = track.key || "—";
+  if (summaryKey) summaryKey.textContent = formatKey(track.key, track.scale, i18nT) || "—";
   if (summaryBpm) summaryBpm.textContent = track.bpm ? String(track.bpm) : "—";
-  if (summaryScale) summaryScale.textContent = track.scale || "";
-  if (summaryScaleName) summaryScaleName.textContent = track.scale || "—";
   if (summaryLufs) summaryLufs.textContent = track.lufs != null ? Number(track.lufs).toFixed(1) : "—";
   if (summaryPeak) summaryPeak.textContent = track.peakDb != null ? i18nT("job.peakDb", { value: Number(track.peakDb).toFixed(1) }) : "";
   if (summaryDuration) summaryDuration.textContent = track.duration ? fmtTime(track.duration) : "—";
@@ -894,16 +890,9 @@ function applyTrackInfoToPanel(track) {
   // The now-playing square shows the same format icon the library row does.
   paintNowPlayingArt(trackFormat(track));
   if (favBtn) {
-    favBtn.classList.toggle("active", Boolean(track.favorite));
-    favBtn.setAttribute("aria-pressed", String(Boolean(track.favorite)));
+    paintFavButton(favBtn, Boolean(track.favorite));
     favBtn.onclick = () => {
-      if (!_currentTrackId) return;
-      const t = tracks[_currentTrackId];
-      if (!t) return;
-      t.favorite = !t.favorite;
-      favBtn.classList.toggle("active", t.favorite);
-      favBtn.setAttribute("aria-pressed", String(t.favorite));
-      saveState();
+      if (_currentTrackId) toggleFavorite(_currentTrackId);
     };
   }
 
@@ -923,7 +912,6 @@ function applyTrackInfoToPanel(track) {
     summaryConfidence.textContent = "";
     summaryConfidence.style.removeProperty("--confidence-pct");
     summaryConfidence.classList.add("hidden");
-    summaryConfidenceLabel?.classList.add("hidden");
     if (track.keyConfidence != null) {
       const confidence = Math.max(0, Math.min(100, Number(track.keyConfidence)));
       const confSpan = document.createElement("span");
@@ -931,7 +919,6 @@ function applyTrackInfoToPanel(track) {
       summaryConfidence.appendChild(confSpan);
       summaryConfidence.style.setProperty("--confidence-pct", confidence);
       summaryConfidence.classList.remove("hidden");
-      summaryConfidenceLabel?.classList.remove("hidden");
     }
   }
 }
@@ -953,6 +940,41 @@ function syncTrashToServer(trackId, trashed) {
   const action = trashed ? "trash" : "restore";
   fetch(`/api/jobs/${encodeURIComponent(trackId)}/${action}`, { method: "POST" })
     .catch((e) => console.warn(`[catalog] could not ${action} ${trackId} on the server`, e));
+}
+
+/**
+ * Tell the server a track was favourited or taken back out (#734).
+ *
+ * The server holds the answer the phone reads, and the phone can change it, so
+ * this side adopts the server's value on every sync (applyServerFavorite) and
+ * only says something when the user presses a heart here. Not awaited, for the
+ * same reason as the Trash: a heart must answer at once.
+ */
+function syncFavoriteToServer(trackId, favorite) {
+  fetch(`/api/jobs/${encodeURIComponent(trackId)}/favorite`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ favorite }),
+  }).catch((e) => console.warn(`[catalog] could not save the favourite for ${trackId}`, e));
+}
+
+/**
+ * Take the server's favourite for a track this side already knows. Returns
+ * whether anything changed here.
+ *
+ * null on the server means no client has said either way, which is every
+ * track from before favourites moved there. A heart set here then is handed up
+ * rather than dropped; anything the server does know wins, because the phone
+ * may have changed it since.
+ */
+function applyServerFavorite(track, state) {
+  if (state.favorite == null) {
+    if (track.favorite) syncFavoriteToServer(state.job_id, true);
+    return false;
+  }
+  if (Boolean(track.favorite) === state.favorite) return false;
+  track.favorite = state.favorite;
+  return true;
 }
 
 function moveTrackToTrash(trackId) {
@@ -1069,7 +1091,7 @@ async function loadTrackIntoStudio(trackId) {
   applyStoredStemSelection(track);
   setCurrentTrack(trackId);
 
-  // The composer is an input the Split stems button submits, not a caption for
+  // The composer is an input the Extract stems button submits, not a caption for
   // the open track, so it may only ever hold something that can actually be
   // imported. A `local:` source is a file that was uploaded once and is not
   // reachable again; putting its bare filename here armed the button with a
@@ -1092,7 +1114,7 @@ async function loadTrackIntoStudio(trackId) {
     // `required` is the guard for "the button has nothing to act on", and it
     // is a blunt one: the browser refuses the submit before any handler runs,
     // so it must not be set while the button has a track to re-split. Setting
-    // it there made pressing Split stems on an upload answer "please fill out
+    // it there made pressing Extract stems on an upload answer "please fill out
     // this field" instead of separating it.
     if (importable || resplittable) urlInput.removeAttribute("required");
     else urlInput.setAttribute("required", "");
@@ -1111,7 +1133,7 @@ async function loadTrackIntoStudio(trackId) {
 }
 
 /**
- * Aim the Split stems button at a track rather than at the composer.
+ * Aim the Extract stems button at a track rather than at the composer.
  *
  * Carried on the button itself rather than in a module variable so job.js can
  * read it at submit time without the two files having to agree on an import
@@ -1425,6 +1447,54 @@ function dropOnFolder(folderId, trackId) {
   render();
 }
 
+function paintFavButton(btn, on) {
+  btn.classList.toggle("active", on);
+  btn.setAttribute("aria-pressed", String(on));
+}
+
+/**
+ * Flip a track's favourite, from whichever heart was pressed.
+ *
+ * The Now Playing heart used to be the only one, and it disappears with its
+ * card below 1460 px (#724), which left no way to favourite at all. Library
+ * rows have one too now, and every heart goes through here so none of them can
+ * disagree with the store or with each other.
+ */
+export function toggleFavorite(trackId) {
+  const track = tracks[trackId];
+  if (!track) return;
+  track.favorite = !track.favorite;
+  syncFavoriteToServer(trackId, track.favorite);
+  saveState();
+  if (trackId === _currentTrackId) {
+    const favBtn = document.getElementById("fav-btn");
+    if (favBtn) paintFavButton(favBtn, track.favorite);
+  }
+  // Rows show the state at rest, and the Favorites view lists by it.
+  render();
+}
+
+function favButtonHtml(track) {
+  const on = Boolean(track.favorite);
+  const label = i18nT(on ? "track.unfavoriteTitle" : "track.favoriteTitle", {
+    title: track.title ?? i18nT("track.unknown"),
+  });
+  return `<button class="cat-fav${on ? " active" : ""}" type="button" aria-pressed="${on}"
+      title="${esc(i18nT(on ? "track.unfavorite" : "track.favorite"))}" aria-label="${esc(label)}">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="${on ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+      </svg>
+    </button>`;
+}
+
+function wireFavButton(el, trackId) {
+  el.querySelector(".cat-fav")?.addEventListener("click", (e) => {
+    // The row itself loads the track on click.
+    e.stopPropagation();
+    toggleFavorite(trackId);
+  });
+}
+
 function wireTrackDragAndLoad(el, trackId) {
   el.draggable = true;
   el.addEventListener("dragstart", (e) => {
@@ -1432,7 +1502,7 @@ function wireTrackDragAndLoad(el, trackId) {
   });
   el.addEventListener("dragend", () => endDrag(el));
   el.addEventListener("click", (e) => {
-    if (e.target.closest(".cat-del")) return;
+    if (e.target.closest(".cat-del, .cat-fav")) return;
     loadTrackIntoStudio(trackId);
   });
 }
@@ -1635,7 +1705,7 @@ function renderRecentItem(trackId) {
   if (!track) return null;
   const el = document.createElement("div");
   const isUnavailable = track.status === "unavailable";
-  el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}`;
+  el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}${track.favorite ? " is-fav" : ""}`;
   el.dataset.id = trackId;
   el.innerHTML = `
     <div class="cat-thumb">${thumbHtml(track)}</div>
@@ -1644,7 +1714,9 @@ function renderRecentItem(trackId) {
       <div class="cat-sub">${trackSublineHtml(track)}</div>
     </div>
     <div class="cat-status${PROCESSING_STATUSES.has(track.status) ? " processing" : isUnavailable ? " unavailable" : ""}"></div>
+    <div class="cat-actions">${favButtonHtml(track)}</div>
   `;
+  wireFavButton(el, trackId);
   wireTrackDragAndLoad(el, trackId);
   return el;
 }
@@ -1702,7 +1774,7 @@ function renderTrackItem(trackId, { inTrash = false } = {}) {
 
   const el = document.createElement("div");
   const isUnavailable = track.status === "unavailable";
-  el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}`;
+  el.className = `cat-item${trackId === _currentTrackId ? " active" : ""}${isUnavailable ? " unavailable" : ""}${!inTrash && track.favorite ? " is-fav" : ""}`;
   el.dataset.id = trackId;
 
   el.innerHTML = `
@@ -1712,12 +1784,12 @@ function renderTrackItem(trackId, { inTrash = false } = {}) {
       <div class="cat-sub">${trackSublineHtml(track, { inTrash })}</div>
     </div>
     <div class="cat-status${PROCESSING_STATUSES.has(track.status) ? " processing" : isUnavailable ? " unavailable" : ""}"></div>
-    ${inTrash ? "" : `<button class="cat-del" type="button" title="${esc(i18nT("track.moveToTrash"))}">
+    ${inTrash ? "" : `<div class="cat-actions">${favButtonHtml(track)}<button class="cat-del" type="button" title="${esc(i18nT("track.moveToTrash"))}">
       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
         <polyline points="3 6 5 6 21 6"></polyline>
         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
       </svg>
-    </button>`}
+    </button></div>`}
   `;
   el.querySelector(".cat-del")?.setAttribute("aria-label", i18nT("track.moveTitleToTrash", { title: track.title ?? i18nT("track.unknown") }));
 
@@ -1725,6 +1797,7 @@ function renderTrackItem(trackId, { inTrash = false } = {}) {
     e.stopPropagation();
     moveTrackToTrash(trackId);
   });
+  wireFavButton(el, trackId);
 
   wireTrackDragAndLoad(el, trackId);
 
@@ -3426,6 +3499,7 @@ async function syncWithServer() {
     for (const state of jobs) {
       const known = tracks[state.job_id];
       if (known) {
+        if (applyServerFavorite(known, state)) backfilled = true;
         // Tracks saved before the server reported a format (#690) only learn
         // it when they are opened. Taking it from here instead means the
         // whole library shows its icons at startup.
@@ -3455,11 +3529,15 @@ async function syncWithServer() {
       if (deletedIds.has(state.job_id)) continue; // hard-deleted, skip
       const track = stateMetadataToTrack(state, { id: state.job_id, status: state.status });
       track.id = state.job_id;
+      if (state.favorite) track.favorite = true;
       addTrackToLibrary(track);
     }
     if (backfilled) {
       saveState();
       render();
+      const favBtn = document.getElementById("fav-btn");
+      const current = tracks[_currentTrackId];
+      if (favBtn && current) paintFavButton(favBtn, Boolean(current.favorite));
     }
     reconcileAvailability(jobs);
   } catch (e) { console.warn("[catalog] failed to load jobs from backend:", e); }
@@ -4006,7 +4084,13 @@ async function wireGeneralSettings(overlay) {
     }
     if (deviceDesc) {
       const resolved = d.demucs_device_resolved ? i18nT("settings.device.currently", { device: d.demucs_device_resolved }) : "";
-      deviceDesc.textContent = i18nT("settings.device.desc", { resolved });
+      // torch installed but unloadable stops separation on every device, CPU
+      // included, so this replaces the usual line rather than sitting under a
+      // device list that looks healthy (#730).
+      deviceDesc.textContent = d.torch_error
+        ? i18nT("settings.device.torchBroken")
+        : i18nT("settings.device.desc", { resolved });
+      deviceDesc.classList.toggle("is-broken", !!d.torch_error);
     }
   };
 
@@ -4913,4 +4997,13 @@ export async function initCatalog() {
 
   loadCurrentVersion().finally(checkForUpdate);
   syncWithServer();
+  // A heart pressed on the phone (#734) shows here the next time this window
+  // is looked at, rather than only after a reload. At most every 15 seconds,
+  // since switching windows back and forth is not new information.
+  let lastFocusSync = Date.now();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || Date.now() - lastFocusSync < 15_000) return;
+    lastFocusSync = Date.now();
+    syncWithServer();
+  });
 }
